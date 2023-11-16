@@ -26,7 +26,7 @@ from langchain.chains.query_constructor.prompt import (
     SUFFIX_WITHOUT_DATA_SOURCE,
     USER_SPECIFIED_EXAMPLE_PROMPT,
 )
-from langchain.chains.query_constructor.schema import AttributeInfo
+from langchain.chains.query_constructor.schema import AttributeInfo, VirtualColumnName
 from langchain.output_parsers.json import parse_and_check_json_markdown
 from langchain.prompts.few_shot import FewShotPromptTemplate
 from langchain.schema import BaseOutputParser, BasePromptTemplate, OutputParserException
@@ -66,7 +66,7 @@ class StructuredQueryOutputParser(BaseOutputParser[StructuredQuery]):
         cls,
         allowed_comparators: Optional[Sequence[Comparator]] = None,
         allowed_operators: Optional[Sequence[Operator]] = None,
-        allowed_attributes: Optional[Sequence[str]] = None,
+        attributes: Optional[Sequence[Union[AttributeInfo, dict]]] = None,
         fix_invalid: bool = False,
     ) -> StructuredQueryOutputParser:
         """
@@ -88,7 +88,7 @@ class StructuredQueryOutputParser(BaseOutputParser[StructuredQuery]):
                     filter,
                     allowed_comparators=allowed_comparators,
                     allowed_operators=allowed_operators,
-                    allowed_attributes=allowed_attributes,
+                    attributes=attributes,
                 )
                 return fixed
 
@@ -96,7 +96,7 @@ class StructuredQueryOutputParser(BaseOutputParser[StructuredQuery]):
             ast_parse = get_parser(
                 allowed_comparators=allowed_comparators,
                 allowed_operators=allowed_operators,
-                allowed_attributes=allowed_attributes,
+                attributes=attributes,
             ).parse
         return cls(ast_parse=ast_parse)
 
@@ -106,7 +106,7 @@ def fix_filter_directive(
     *,
     allowed_comparators: Optional[Sequence[Comparator]] = None,
     allowed_operators: Optional[Sequence[Operator]] = None,
-    allowed_attributes: Optional[Sequence[str]] = None,
+    attributes: Optional[Sequence[Union[AttributeInfo, dict]]] = None,
 ) -> Optional[FilterDirective]:
     """Fix invalid filter directive.
 
@@ -119,15 +119,20 @@ def fix_filter_directive(
     Returns:
         Fixed filter directive.
     """
-    if (
-        not (allowed_comparators or allowed_operators or allowed_attributes)
-    ) or not filter:
+    attribute_names = []
+    if attributes:
+        for n in attributes:
+            if isinstance(n, AttributeInfo):
+                attribute_names.append(n.name)
+            elif isinstance(n, dict):
+                attribute_names.append(n["name"])
+    if (not (allowed_comparators or allowed_operators or attributes)) or not filter:
         return filter
 
     elif isinstance(filter, Comparison):
         if allowed_comparators and filter.comparator not in allowed_comparators:
             return None
-        if allowed_attributes and filter.attribute not in allowed_attributes:
+        if attributes and filter.attribute not in attributes:
             return None
         return filter
     elif isinstance(filter, Operation):
@@ -138,7 +143,7 @@ def fix_filter_directive(
                 arg,
                 allowed_comparators=allowed_comparators,
                 allowed_operators=allowed_operators,
-                allowed_attributes=allowed_attributes,
+                attributes=attributes,
             )
             for arg in filter.arguments
         ]
@@ -159,7 +164,14 @@ def fix_filter_directive(
 def _format_attribute_info(info: Sequence[Union[AttributeInfo, dict]]) -> str:
     info_dicts = {}
     for i in info:
-        i_dict = dict(i)
+        if type(i) is AttributeInfo and type(i.name) is VirtualColumnName:
+            i_dict = {
+                "name": str(i.name),
+                "description": i.description,
+                "type": i.type,
+            }
+        else:
+            i_dict = dict(i)
         info_dicts[i_dict.pop("name")] = i_dict
     return json.dumps(info_dicts, indent=4).replace("{", "{{").replace("}", "}}")
 
@@ -288,15 +300,10 @@ def load_query_constructor_chain(
         enable_limit=enable_limit,
         schema_prompt=schema_prompt,
     )
-    allowed_attributes = []
-    for ainfo in attribute_info:
-        allowed_attributes.append(
-            ainfo.name if isinstance(ainfo, AttributeInfo) else ainfo["name"]
-        )
     output_parser = StructuredQueryOutputParser.from_components(
         allowed_comparators=allowed_comparators,
         allowed_operators=allowed_operators,
-        allowed_attributes=allowed_attributes,
+        attributes=attribute_info,
     )
     # For backwards compatibility.
     prompt.output_parser = output_parser
@@ -346,15 +353,10 @@ def load_query_constructor_runnable(
         schema_prompt=schema_prompt,
         **kwargs,
     )
-    allowed_attributes = []
-    for ainfo in attribute_info:
-        allowed_attributes.append(
-            ainfo.name if isinstance(ainfo, AttributeInfo) else ainfo["name"]
-        )
     output_parser = StructuredQueryOutputParser.from_components(
         allowed_comparators=allowed_comparators,
         allowed_operators=allowed_operators,
-        allowed_attributes=allowed_attributes,
+        attributes=attribute_info,
         fix_invalid=fix_invalid,
     )
     return prompt | llm | output_parser

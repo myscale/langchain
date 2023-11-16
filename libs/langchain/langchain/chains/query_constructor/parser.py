@@ -1,9 +1,10 @@
 import datetime
 import warnings
-from typing import Any, Literal, Optional, Sequence, Union
+from typing import Any, Dict, Literal, Optional, Sequence, Union
 
 from typing_extensions import TypedDict
 
+from langchain.chains.query_constructor.schema import AttributeInfo, VirtualColumnName
 from langchain.utils import check_package_version
 
 try:
@@ -71,13 +72,27 @@ class QueryTransformer(Transformer):
         *args: Any,
         allowed_comparators: Optional[Sequence[Comparator]] = None,
         allowed_operators: Optional[Sequence[Operator]] = None,
-        allowed_attributes: Optional[Sequence[str]] = None,
+        attributes: Optional[Sequence[Union[AttributeInfo, dict]]] = None,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
         self.allowed_comparators = allowed_comparators
         self.allowed_operators = allowed_operators
-        self.allowed_attributes = allowed_attributes
+        self.allowed_attributes = []
+        self.virtual_column_names: Optional[Dict[str, VirtualColumnName]]
+        if attributes:
+            for n in attributes:
+                if isinstance(n, AttributeInfo):
+                    self.allowed_attributes.append(str(n.name))
+                elif isinstance(n, dict):
+                    self.allowed_attributes.append(n["name"])
+            self.virtual_column_names = {
+                str(i.name): i.name
+                for i in attributes
+                if type(i) is AttributeInfo and type(i.name) is VirtualColumnName
+            }
+        else:
+            self.virtual_column_names = None
 
     def program(self, *items: Any) -> tuple:
         return items
@@ -90,7 +105,11 @@ class QueryTransformer(Transformer):
                     f"Received invalid attributes {args[0]}. Allowed attributes are "
                     f"{self.allowed_attributes}"
                 )
-            return Comparison(comparator=func, attribute=args[0], value=args[1])
+            _attr_name = args[0]
+            if self.virtual_column_names:
+                if args[0] in self.virtual_column_names:
+                    _attr_name = self.virtual_column_names[args[0]]
+            return Comparison(comparator=func, attribute=_attr_name, value=args[1])
         elif len(args) == 1 and func in (Operator.AND, Operator.OR):
             return args[0]
         else:
@@ -158,7 +177,7 @@ class QueryTransformer(Transformer):
 def get_parser(
     allowed_comparators: Optional[Sequence[Comparator]] = None,
     allowed_operators: Optional[Sequence[Operator]] = None,
-    allowed_attributes: Optional[Sequence[str]] = None,
+    attributes: Optional[Sequence[Union[AttributeInfo, dict]]] = None,
 ) -> Lark:
     """
     Returns a parser for the query language.
@@ -178,6 +197,6 @@ def get_parser(
     transformer = QueryTransformer(
         allowed_comparators=allowed_comparators,
         allowed_operators=allowed_operators,
-        allowed_attributes=allowed_attributes,
+        attributes=attributes,
     )
     return Lark(GRAMMAR, parser="lalr", transformer=transformer, start="program")

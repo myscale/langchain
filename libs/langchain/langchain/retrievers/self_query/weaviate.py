@@ -9,6 +9,7 @@ from langchain.chains.query_constructor.ir import (
     StructuredQuery,
     Visitor,
 )
+from langchain.chains.query_constructor.schema import VirtualColumnName
 
 
 class WeaviateTranslator(Visitor):
@@ -46,6 +47,14 @@ class WeaviateTranslator(Visitor):
         return {"operator": self._format_func(operation.operator), "operands": args}
 
     def visit_comparison(self, comparison: Comparison) -> Dict:
+        if isinstance(comparison.attribute, VirtualColumnName):
+            attribute = comparison.attribute()
+        elif isinstance(comparison.attribute, str):
+            attribute = comparison.attribute
+        else:
+            raise TypeError(
+                f"Unknown type {type(comparison.attribute)} for `comparison.attribute`!"
+            )
         value_type = "valueText"
         value = comparison.value
         if isinstance(comparison.value, bool):
@@ -63,7 +72,7 @@ class WeaviateTranslator(Visitor):
             date = datetime.strptime(comparison.value["date"], "%Y-%m-%d")
             value = date.strftime("%Y-%m-%dT%H:%M:%SZ")
         filter = {
-            "path": [comparison.attribute],
+            "path": [attribute],
             "operator": self._format_func(comparison.comparator),
             value_type: value,
         }

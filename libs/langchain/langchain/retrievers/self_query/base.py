@@ -67,8 +67,6 @@ def _get_builtin_translator(vectorstore: VectorStore) -> Visitor:
     }
     if isinstance(vectorstore, Qdrant):
         return QdrantTranslator(metadata_key=vectorstore.metadata_payload_key)
-    elif isinstance(vectorstore, MyScale):
-        return MyScaleTranslator(metadata_key=vectorstore.metadata_column)
     elif isinstance(vectorstore, Redis):
         return RedisTranslator.from_vectorstore(vectorstore)
     elif vectorstore.__class__ in BUILTIN_TRANSLATORS:
