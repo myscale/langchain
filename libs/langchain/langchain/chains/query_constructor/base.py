@@ -2,14 +2,25 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, List, Optional, Sequence, Tuple, Union, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models import BaseLanguageModel
 from langchain_core.output_parsers import BaseOutputParser
 from langchain_core.prompts import BasePromptTemplate
 from langchain_core.prompts.few_shot import FewShotPromptTemplate
-from langchain_core.runnables import Runnable
+from langchain_core.pydantic_v1 import validator
+from langchain_core.runnables import Runnable, RunnableConfig, RunnableSerializable
 
 from langchain.chains.llm import LLMChain
 from langchain.chains.query_constructor.ir import (
@@ -33,7 +44,7 @@ from langchain.chains.query_constructor.prompt import (
     SUFFIX_WITHOUT_DATA_SOURCE,
     USER_SPECIFIED_EXAMPLE_PROMPT,
 )
-from langchain.chains.query_constructor.schema import AttributeInfo
+from langchain.chains.query_constructor.schema import AttributeInfo, VirtualColumnName
 from langchain.output_parsers.json import parse_and_check_json_markdown
 
 
@@ -104,6 +115,62 @@ class StructuredQueryOutputParser(BaseOutputParser[StructuredQuery]):
         return cls(ast_parse=ast_parse)
 
 
+class VirtualColumnParser(RunnableSerializable[StructuredQuery, StructuredQuery]):
+    """Virtual Column Parser which is compatible with LCEL"""
+
+    attributes: Sequence[Union[AttributeInfo, dict]]
+    virtual_attribute_map: Dict[str, Callable] = {}
+
+    @validator("virtual_attribute_map", always=True)
+    def _compute_map(cls, v: Any, values: Any, **kwargs: Any) -> Dict[str, Callable]:
+        _map = {}
+        for a in values["attributes"]:
+            a = dict(a)
+            if isinstance(a["name"], VirtualColumnName):
+                _map[str(a["name"])] = a["name"].to_query
+        return _map
+
+    def _map_virtual_column(self, filter: Comparison) -> Comparison:
+        if filter.attribute in self.virtual_attribute_map:
+            return Comparison(
+                comparator=filter.comparator,
+                attribute=self.virtual_attribute_map[filter.attribute](),
+                value=filter.value,
+            )
+        return filter
+
+    def _traverse_query(
+        self, filter: FilterDirective, config: Optional[RunnableConfig] = None
+    ) -> Optional[FilterDirective]:
+        if not filter:
+            return filter
+        elif isinstance(filter, Comparison):
+            return self._map_virtual_column(filter)
+        elif isinstance(filter, Operation):
+            args = [
+                self._traverse_query(arg, config=config) for arg in filter.arguments
+            ]
+            args = [arg for arg in args if arg is not None]
+            if not args:
+                return None
+            elif len(args) == 1 and filter.operator in (Operator.AND, Operator.OR):
+                return args[0]
+            else:
+                return Operation(
+                    operator=filter.operator,
+                    arguments=args,
+                )
+        else:
+            return filter
+
+    def invoke(
+        self, inputs: StructuredQuery, config: Optional[RunnableConfig] = None
+    ) -> StructuredQuery:
+        if inputs.filter:
+            inputs.filter = self._traverse_query(inputs.filter, config=config)
+        return inputs
+
+
 def fix_filter_directive(
     filter: Optional[FilterDirective],
     *,
@@ -163,6 +230,12 @@ def _format_attribute_info(info: Sequence[Union[AttributeInfo, dict]]) -> str:
     info_dicts = {}
     for i in info:
         i_dict = dict(i)
+        if type(i) is AttributeInfo and type(i.name) is VirtualColumnName:
+            i_dict = {
+                "name": str(i.name),
+                "description": i.description,
+                "type": i.type,
+            }
         info_dicts[i_dict.pop("name")] = i_dict
     return json.dumps(info_dicts, indent=4).replace("{", "{{").replace("}", "}}")
 
@@ -282,6 +355,16 @@ def load_query_constructor_chain(
     Returns:
         A LLMChain that can be used to construct queries.
     """
+
+    class _StructuredQueryVirtualColParser(BaseOutputParser[StructuredQuery]):
+        struct_query_parser: StructuredQueryOutputParser
+        virt_col_parser: VirtualColumnParser
+
+        def parse(self, text: str) -> StructuredQuery:
+            query = self.struct_query_parser.parse(text)
+            query = self.virt_col_parser.invoke(query)
+            return query
+
     prompt = get_query_constructor_prompt(
         document_contents,
         attribute_info,
@@ -294,12 +377,16 @@ def load_query_constructor_chain(
     allowed_attributes = []
     for ainfo in attribute_info:
         allowed_attributes.append(
-            ainfo.name if isinstance(ainfo, AttributeInfo) else ainfo["name"]
+            str(ainfo.name) if isinstance(ainfo, AttributeInfo) else str(ainfo["name"])
         )
-    output_parser = StructuredQueryOutputParser.from_components(
+    struct_query_parser = StructuredQueryOutputParser.from_components(
         allowed_comparators=allowed_comparators,
         allowed_operators=allowed_operators,
         allowed_attributes=allowed_attributes,
+    )
+    virt_col_parser = VirtualColumnParser(attributes=attribute_info)
+    output_parser = _StructuredQueryVirtualColParser(
+        struct_query_parser=struct_query_parser, virt_col_parser=virt_col_parser
     )
     # For backwards compatibility.
     prompt.output_parser = output_parser
@@ -352,7 +439,7 @@ def load_query_constructor_runnable(
     allowed_attributes = []
     for ainfo in attribute_info:
         allowed_attributes.append(
-            ainfo.name if isinstance(ainfo, AttributeInfo) else ainfo["name"]
+            str(ainfo.name) if isinstance(ainfo, AttributeInfo) else str(ainfo["name"])
         )
     output_parser = StructuredQueryOutputParser.from_components(
         allowed_comparators=allowed_comparators,
@@ -360,4 +447,5 @@ def load_query_constructor_runnable(
         allowed_attributes=allowed_attributes,
         fix_invalid=fix_invalid,
     )
-    return prompt | llm | output_parser
+    virt_col_parser = VirtualColumnParser(attributes=attribute_info)
+    return prompt | llm | output_parser | virt_col_parser
